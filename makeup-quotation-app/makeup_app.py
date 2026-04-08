@@ -1,7 +1,5 @@
 import streamlit as st
-import sqlite3
 import json
-import hashlib
 import os
 import base64
 from datetime import date, timedelta
@@ -11,14 +9,9 @@ try:
 except ImportError:
     pdfkit = None
 
-st.set_page_config(page_title="Makeup Quotation App", page_icon="💄", layout="wide")
+from supabase import create_client, Client
 
-DB_PATH = "makeup_quotes.db"
-DEFAULT_SERVICES = [
-    {"name": "Bridal Makeup", "price": 25000.0},
-    {"name": "Engagement Makeup", "price": 18000.0},
-    {"name": "Hairstyling", "price": 5000.0},
-]
+st.set_page_config(page_title="Makeup Quotation App", page_icon="💄", layout="wide")
 
 TEMPLATE_OPTIONS = [
     "Luxury Blush",
@@ -33,6 +26,12 @@ TEMPLATE_OPTIONS = [
     "Signature Studio",
 ]
 
+DEFAULT_SERVICES = [
+    {"name": "Bridal Makeup", "price": 25000.0},
+    {"name": "Engagement Makeup", "price": 18000.0},
+    {"name": "Hairstyling", "price": 5000.0},
+]
+
 DEFAULT_TERMS = [
     "50% advance is required to confirm the booking.",
     "Balance amount must be paid before the event starts.",
@@ -40,151 +39,16 @@ DEFAULT_TERMS = [
 ]
 
 
-# ---------- Database ----------
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+# ---------- Supabase ----------
+@st.cache_resource
+
+def get_supabase() -> Client:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            business_name TEXT,
-            artist_name TEXT,
-            contact TEXT,
-            logo_base64 TEXT,
-            selected_template TEXT,
-            profile_json TEXT,
-            form_json TEXT
-        )
-        """
-    )
-    conn.commit()
-
-    # Backward-compatible migration for older DBs that still have logo_url only.
-    cur.execute("PRAGMA table_info(users)")
-    cols = [row[1] for row in cur.fetchall()]
-    if "logo_base64" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN logo_base64 TEXT")
-        conn.commit()
-
-    conn.close()
-
-
-init_db()
-
-
-# ---------- Auth ----------
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
-
-def create_user(email: str, password: str):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    profile = {
-        "artist_name": "",
-        "business_name": "",
-        "contact": "",
-        "logo_base64": "",
-        "selected_template": TEMPLATE_OPTIONS[0],
-    }
-    form_config = {
-        "show_travel_charges": True,
-        "show_extra_charges": True,
-        "show_discount": True,
-        "show_advance_paid": True,
-        "service_options": DEFAULT_SERVICES,
-        "terms": DEFAULT_TERMS,
-    }
-
-    try:
-        cur.execute(
-            """
-            INSERT INTO users (email, password_hash, selected_template, business_name, artist_name, contact, logo_base64, profile_json, form_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                email.strip().lower(),
-                hash_password(password),
-                TEMPLATE_OPTIONS[0],
-                "",
-                "",
-                "",
-                "",
-                json.dumps(profile),
-                json.dumps(form_config),
-            ),
-        )
-        conn.commit()
-        return True, "Account created successfully."
-    except sqlite3.IntegrityError:
-        return False, "Email already exists."
-    finally:
-        conn.close()
-
-
-
-def login_user(email: str, password: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, email FROM users WHERE email = ? AND password_hash = ?",
-        (email.strip().lower(), hash_password(password)),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-
-def get_user_by_email(email: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, email, selected_template, profile_json, form_json FROM users WHERE email = ?",
-        (email.strip().lower(),),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-
-def update_user_settings(email: str, profile: dict, form_config: dict, selected_template: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE users
-        SET selected_template = ?,
-            business_name = ?,
-            artist_name = ?,
-            contact = ?,
-            logo_base64 = ?,
-            profile_json = ?,
-            form_json = ?
-        WHERE email = ?
-        """,
-        (
-            selected_template,
-            profile.get("business_name", ""),
-            profile.get("artist_name", ""),
-            profile.get("contact", ""),
-            profile.get("logo_base64", ""),
-            json.dumps(profile),
-            json.dumps(form_config),
-            email.strip().lower(),
-        ),
-    )
-    conn.commit()
-    conn.close()
+supabase = get_supabase()
 
 
 # ---------- Helpers ----------
@@ -227,7 +91,6 @@ def get_template_style(template_name: str):
 def image_file_to_base64(uploaded_file):
     if uploaded_file is None:
         return None
-
     file_bytes = uploaded_file.getvalue()
     mime_type = uploaded_file.type or "image/png"
     encoded = base64.b64encode(file_bytes).decode("utf-8")
@@ -235,18 +98,155 @@ def image_file_to_base64(uploaded_file):
 
 
 
+def get_wkhtmltopdf_path():
+    candidate_paths = [
+        r"C:\Users\ankus\Downloads\wkhtmltox-0.12.6-1.mxe-cross-win64\wkhtmltox\bin\wkhtmltopdf.exe",
+        r"C:\Program Files (x86)\wkhtmltopdf\bin\wkhtmltopdf.exe",
+        "/usr/bin/wkhtmltopdf",
+        "/usr/local/bin/wkhtmltopdf",
+    ]
+    for path in candidate_paths:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+
+def generate_pdf_bytes(html: str):
+    if pdfkit is None:
+        return None, "pdfkit is not installed. Add pdfkit to requirements.txt"
+
+    wkhtmltopdf_path = get_wkhtmltopdf_path()
+    if not wkhtmltopdf_path:
+        return None, "wkhtmltopdf executable was not found on this machine."
+
+    try:
+        config = pdfkit.configuration(wkhtmltopdf=wkhtmltopdf_path)
+        options = {
+            "page-size": "A4",
+            "margin-top": "10mm",
+            "margin-right": "10mm",
+            "margin-bottom": "10mm",
+            "margin-left": "10mm",
+            "encoding": "UTF-8",
+            "enable-local-file-access": None,
+            "quiet": "",
+        }
+        pdf_bytes = pdfkit.from_string(html, False, configuration=config, options=options)
+        return pdf_bytes, None
+    except Exception as e:
+        return None, str(e)
+
+
+# ---------- Supabase data ----------
+def get_default_profile(email: str):
+    return {
+        "email": email,
+        "artist_name": "",
+        "business_name": "",
+        "contact": "",
+        "logo_base64": "",
+        "selected_template": TEMPLATE_OPTIONS[0],
+    }
+
+
+
+def get_default_form_config():
+    return {
+        "show_travel_charges": True,
+        "show_extra_charges": True,
+        "show_discount": True,
+        "show_advance_paid": True,
+        "service_options": DEFAULT_SERVICES,
+        "terms": DEFAULT_TERMS,
+    }
+
+
+
+def get_profile(user_id: str, email: str):
+    result = (
+        supabase.table("profiles")
+        .select("*")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+
+    if result.data:
+        row = result.data[0]
+        profile = {
+            "email": row.get("email") or email,
+            "artist_name": row.get("artist_name") or "",
+            "business_name": row.get("business_name") or "",
+            "contact": row.get("contact") or "",
+            "logo_base64": row.get("logo_base64") or "",
+            "selected_template": row.get("selected_template") or TEMPLATE_OPTIONS[0],
+        }
+        form_config = row.get("form_config") or get_default_form_config()
+        return profile, form_config
+
+    profile = get_default_profile(email)
+    form_config = get_default_form_config()
+    save_profile(user_id, profile, form_config)
+    return profile, form_config
+
+
+
+def save_profile(user_id: str, profile: dict, form_config: dict):
+    payload = {
+        "id": user_id,
+        "email": profile.get("email", ""),
+        "artist_name": profile.get("artist_name", ""),
+        "business_name": profile.get("business_name", ""),
+        "contact": profile.get("contact", ""),
+        "logo_base64": profile.get("logo_base64", ""),
+        "selected_template": profile.get("selected_template", TEMPLATE_OPTIONS[0]),
+        "form_config": form_config,
+        "updated_at": "now()",
+    }
+    return supabase.table("profiles").upsert(payload).execute()
+
+
+
+def save_quotation(user_id: str, quote_data: dict, totals: dict):
+    payload = {
+        "artist_id": user_id,
+        "quote_number": quote_data.get("quote_number", ""),
+        "client_name": quote_data.get("client_name", ""),
+        "client_phone": quote_data.get("client_phone", ""),
+        "event_type": quote_data.get("event_type", ""),
+        "event_date": quote_data.get("event_date", ""),
+        "location": quote_data.get("location", ""),
+        "package_name": quote_data.get("package_name", ""),
+        "selected_template": quote_data.get("selected_template", ""),
+        "grand_total": totals.get("grand_total", 0),
+        "quote_json": quote_data,
+    }
+    return supabase.table("quotations").insert(payload).execute()
+
+
+
+def get_recent_quotations(user_id: str, limit: int = 10):
+    result = (
+        supabase.table("quotations")
+        .select("id, quote_number, client_name, event_type, grand_total, created_at")
+        .eq("artist_id", user_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return result.data or []
+
+
+# ---------- Quotation HTML ----------
 def build_quote_html(data, totals):
     theme = get_template_style(data["selected_template"])
 
     services_html = "".join(
         f"""
         <tr>
-            <td style="padding:12px;border-bottom:1px solid {theme['soft']};">
-                {item['name']}
-            </td>
-            <td style="padding:12px;border-bottom:1px solid {theme['soft']};text-align:right;">
-                {format_inr(item['price'])}
-            </td>
+            <td style="padding:12px;border-bottom:1px solid {theme['soft']};">{item['name']}</td>
+            <td style="padding:12px;border-bottom:1px solid {theme['soft']};text-align:right;">{format_inr(item['price'])}</td>
         </tr>
         """
         for item in data["services"]
@@ -286,15 +286,7 @@ def build_quote_html(data, totals):
     if data.get("logo_base64"):
         logo_html = f"""
         <img src="{data['logo_base64']}"
-             style="
-               max-height:120px;
-               max-width:250px;
-               width:250px;
-               height:120px;
-               object-fit:contain;
-               margin-bottom:12px;
-               display:block; 
-             ">
+             style="max-height:95px;max-width:240px;width:auto;height:auto;object-fit:contain;margin:0 0 12px 0;display:block;" />
         """
 
     payment_rows = [
@@ -315,14 +307,11 @@ def build_quote_html(data, totals):
     <body style="background:#f7f7f7;padding:20px;margin:0;">
         <div style="max-width:920px;margin:auto;background:{theme['bg']};border:1px solid {theme['soft']};border-radius:24px;padding:36px;font-family:{theme['font']};color:{theme['text']};box-shadow:0 12px 34px rgba(0,0,0,0.07);">
 
-            <!-- Header -->
             <table style="width:100%;border-collapse:collapse;border-bottom:2px solid {theme['soft']};margin-bottom:24px;">
                 <tr>
                     <td style="width:62%;vertical-align:top;padding:0 12px 18px 0;">
                         {logo_html}
-                        <h1 style="margin:0;font-size:30px;color:{theme['accent']};line-height:1.1;">
-                            {data['business_name']}
-                        </h1>
+                        <h1 style="margin:0;font-size:30px;color:{theme['accent']};line-height:1.1;">{data['business_name']}</h1>
                         <p style="margin:8px 0 0 0;line-height:1.7;">
                             {data['artist_name']}<br>
                             {data['contact']}<br>
@@ -341,8 +330,7 @@ def build_quote_html(data, totals):
                 </tr>
             </table>
 
-            <!-- Client + Package -->
-            <table style="width:100%;border-collapse:separate;border-spacing:0 0;margin-bottom:24px;">
+            <table style="width:100%;border-collapse:separate;margin-bottom:24px;">
                 <tr>
                     <td style="width:50%;vertical-align:top;padding-right:11px;">
                         <div style="background:{theme['soft']};border-radius:18px;padding:18px;min-height:140px;">
@@ -370,7 +358,6 @@ def build_quote_html(data, totals):
                 </tr>
             </table>
 
-            <!-- Services -->
             <h3 style="color:{theme['accent']};margin:0 0 12px 0;">Services Included</h3>
             <table style="width:100%;border-collapse:collapse;margin-bottom:24px;border-radius:14px;overflow:hidden;background:white;">
                 <thead>
@@ -384,144 +371,113 @@ def build_quote_html(data, totals):
                     {extra_rows}
                     <tr style="background:{theme['soft']};font-weight:bold;">
                         <td style="padding:14px;border-top:2px solid white;">Grand Total</td>
-                        <td style="padding:14px;border-top:2px solid white;text-align:right;">
-                            {format_inr(totals['grand_total'])}
-                        </td>
+                        <td style="padding:14px;border-top:2px solid white;text-align:right;">{format_inr(totals['grand_total'])}</td>
                     </tr>
                 </tbody>
             </table>
 
-            <!-- Terms + Payment -->
-            <table style="width:100%;border-collapse:separate;border-spacing:0 0;">
+            <table style="width:100%;border-collapse:separate;">
                 <tr>
                     <td style="width:60%;vertical-align:top;padding-right:11px;">
                         <h3 style="color:{theme['accent']};margin:0 0 10px 0;">Terms & Conditions</h3>
-                        <ul style="padding-left:20px;line-height:1.8;margin-top:0;">
-                            {terms_html}
-                        </ul>
+                        <ul style="padding-left:20px;line-height:1.8;margin-top:0;">{terms_html}</ul>
 
                         <h3 style="color:{theme['accent']};margin:18px 0 10px 0;">Notes</h3>
-                        <p style="line-height:1.8;margin:0;">
-                            {data['notes'] or 'No additional notes.'}
-                        </p>
+                        <p style="line-height:1.8;margin:0;">{data['notes'] or 'No additional notes.'}</p>
                     </td>
                     <td style="width:40%;vertical-align:top;padding-left:11px;">
                         <div style="background:{theme['soft']};border-radius:18px;padding:20px;">
                             <h3 style="margin:0 0 12px 0;color:{theme['accent']};">Payment Summary</h3>
-                            <p style="line-height:2;margin:0;">
-                                {''.join(payment_rows)}
-                            </p>
+                            <p style="line-height:2;margin:0;">{''.join(payment_rows)}</p>
                         </div>
                     </td>
                 </tr>
             </table>
-
         </div>
     </body>
     </html>
     """
-def get_wkhtmltopdf_path():
-    candidate_paths = [
-        r"C:\Users\ankus\Downloads\wkhtmltox-0.12.6-1.mxe-cross-win64\wkhtmltox\bin\wkhtmltopdf.exe",
-        r"C:\Program Files (x86)\wkhtmltopdf\bin\wkhtmltopdf.exe",
-    ]
-    for path in candidate_paths:
-        if os.path.exists(path):
-            return path
-    return None
 
 
-
-def generate_pdf_bytes(html: str):
-    if pdfkit is None:
-        return None, "pdfkit is not installed. Run: pip install pdfkit"
-
-    wkhtmltopdf_path = get_wkhtmltopdf_path()
-    if not wkhtmltopdf_path:
-        return None, (
-            "wkhtmltopdf was not found. Install it first, then make sure it exists at "
-            "C:\\Program Files\\wkhtmltopdf\\bin\\wkhtmltopdf.exe"
-        )
-
-    try:
-        config = pdfkit.configuration(wkhtmltopdf=wkhtmltopdf_path)
-        options = {
-            "page-size": "A4",
-            "margin-top": "10mm",
-            "margin-right": "10mm",
-            "margin-bottom": "10mm",
-            "margin-left": "10mm",
-            "encoding": "UTF-8",
-            "enable-local-file-access": None,
-            "quiet": "",
-        }
-        pdf_bytes = pdfkit.from_string(html, False, configuration=config, options=options)
-        return pdf_bytes, None
-    except Exception as e:
-        return None, str(e)
-
-
-# ---------- Session state ----------
+# ---------- Session ----------
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
-if "user_email" not in st.session_state:
-    st.session_state.user_email = ""
+if "user" not in st.session_state:
+    st.session_state.user = None
 if "quote_data" not in st.session_state:
     st.session_state.quote_data = None
 
 
 # ---------- UI ----------
 st.title("💄 Makeup Artist Quotation Studio")
-st.caption("Login, save your brand details, customize your quotation form, and generate quotes using 10 different templates.")
+st.caption("Login, save your brand details in Supabase, customize your quotation form, and generate quotes using 10 different templates.")
 
 if not st.session_state.logged_in:
     login_tab, register_tab = st.tabs(["Login", "Register"])
 
     with login_tab:
         with st.form("login_form"):
-            email = st.text_input("Email")
-            password = st.text_input("Password", type="password")
+            login_email = st.text_input("Email")
+            login_password = st.text_input("Password", type="password")
             login_btn = st.form_submit_button("Login")
+
         if login_btn:
-            user = login_user(email, password)
-            if user:
-                st.session_state.logged_in = True
-                st.session_state.user_email = user[1]
-                st.success("Logged in successfully.")
-                st.rerun()
-            else:
-                st.error("Invalid email or password.")
+            try:
+                response = supabase.auth.sign_in_with_password(
+                    {"email": login_email.strip(), "password": login_password}
+                )
+                user = response.user
+                if user:
+                    st.session_state.logged_in = True
+                    st.session_state.user = {
+                        "id": user.id,
+                        "email": user.email,
+                    }
+                    st.success("Logged in successfully.")
+                    st.rerun()
+                else:
+                    st.error("Invalid email or password.")
+            except Exception as e:
+                st.error(f"Login failed: {e}")
 
     with register_tab:
         with st.form("register_form"):
-            new_email = st.text_input("Email", key="register_email")
-            new_password = st.text_input("Password", type="password", key="register_password")
-            create_btn = st.form_submit_button("Create Account")
-        if create_btn:
-            if not new_email.strip() or not new_password.strip():
-                st.error("Email and password are required.")
-            else:
-                ok, msg = create_user(new_email, new_password)
-                if ok:
-                    st.success(msg)
+            reg_email = st.text_input("Email", key="reg_email")
+            reg_password = st.text_input("Password", type="password", key="reg_password")
+            reg_btn = st.form_submit_button("Create Account")
+
+        if reg_btn:
+            try:
+                response = supabase.auth.sign_up(
+                    {"email": reg_email.strip(), "password": reg_password}
+                )
+                user = response.user
+                if user:
+                    save_profile(user.id, get_default_profile(reg_email.strip()), get_default_form_config())
+                    st.success("Account created successfully. You can now log in.")
                 else:
-                    st.error(msg)
+                    st.warning("Signup requested. Please check your email if confirmation is enabled in Supabase Auth settings.")
+            except Exception as e:
+                st.error(f"Registration failed: {e}")
 
 else:
-    user_row = get_user_by_email(st.session_state.user_email)
-    _, _, saved_template, profile_json, form_json = user_row
-    profile = json.loads(profile_json) if profile_json else {}
-    form_config = json.loads(form_json) if form_json else {}
+    user_id = st.session_state.user["id"]
+    user_email = st.session_state.user["email"]
+    profile, form_config = get_profile(user_id, user_email)
 
-    st.sidebar.success(f"Logged in as {st.session_state.user_email}")
-    st.sidebar.info(f"Artist login details are currently saved locally in: {DB_PATH}")
+    st.sidebar.success(f"Logged in as {user_email}")
+    st.sidebar.info("User data is now being stored in Supabase, not local SQLite.")
     if st.sidebar.button("Logout"):
+        try:
+            supabase.auth.sign_out()
+        except Exception:
+            pass
         st.session_state.logged_in = False
-        st.session_state.user_email = ""
+        st.session_state.user = None
         st.session_state.quote_data = None
         st.rerun()
 
-    setup_tab, quote_tab = st.tabs(["Artist Setup", "Create Quotation"])
+    setup_tab, quote_tab, history_tab = st.tabs(["Artist Setup", "Create Quotation", "Recent Quotations"])
 
     with setup_tab:
         left, right = st.columns([1, 1])
@@ -543,8 +499,8 @@ else:
             selected_template = st.selectbox(
                 "Default Template",
                 TEMPLATE_OPTIONS,
-                index=TEMPLATE_OPTIONS.index(profile.get("selected_template", saved_template or TEMPLATE_OPTIONS[0]))
-                if profile.get("selected_template", saved_template or TEMPLATE_OPTIONS[0]) in TEMPLATE_OPTIONS
+                index=TEMPLATE_OPTIONS.index(profile.get("selected_template", TEMPLATE_OPTIONS[0]))
+                if profile.get("selected_template", TEMPLATE_OPTIONS[0]) in TEMPLATE_OPTIONS
                 else 0,
             )
 
@@ -583,6 +539,7 @@ else:
                 final_logo_base64 = new_logo_base64
 
             updated_profile = {
+                "email": user_email,
                 "artist_name": artist_name,
                 "business_name": business_name,
                 "contact": contact,
@@ -597,9 +554,12 @@ else:
                 "service_options": custom_services,
                 "terms": terms,
             }
-            update_user_settings(st.session_state.user_email, updated_profile, updated_form_config, selected_template)
-            st.success("Settings saved successfully.")
-            st.rerun()
+            try:
+                save_profile(user_id, updated_profile, updated_form_config)
+                st.success("Settings saved successfully.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not save profile: {e}")
 
         st.markdown("### Template Preview Palette")
         preview_cols = st.columns(5)
@@ -622,7 +582,7 @@ else:
 
         default_services = form_config.get("service_options", DEFAULT_SERVICES)
         default_terms = form_config.get("terms", DEFAULT_TERMS)
-        current_template = profile.get("selected_template", saved_template or TEMPLATE_OPTIONS[0])
+        current_template = profile.get("selected_template", TEMPLATE_OPTIONS[0])
 
         left_col, right_col = st.columns([0.95, 1.15], gap="large")
 
@@ -631,24 +591,17 @@ else:
                 st.markdown("### Client Details")
                 client_name = st.text_input("Client Name")
                 client_phone = st.text_input("Client Phone")
-                event_type = st.selectbox(
-                    "Event Type",
-                    ["Bridal", "Engagement", "Reception", "Haldi", "Mehendi", "Party Makeup", "Shoot Makeup", "Other"],
-                )
+                event_type = st.selectbox("Event Type", ["Bridal", "Engagement", "Reception", "Haldi", "Mehendi", "Party Makeup", "Shoot Makeup", "Other"])
                 event_date = st.date_input("Event Date", value=date.today() + timedelta(days=14))
                 location = st.text_input("Location")
 
                 st.markdown("### Quotation Details")
-                chosen_template = st.selectbox(
-                    "Choose Template",
-                    TEMPLATE_OPTIONS,
-                    index=TEMPLATE_OPTIONS.index(current_template) if current_template in TEMPLATE_OPTIONS else 0,
-                )
+                chosen_template = st.selectbox("Choose Template", TEMPLATE_OPTIONS, index=TEMPLATE_OPTIONS.index(current_template) if current_template in TEMPLATE_OPTIONS else 0)
                 quote_number = st.text_input("Quote Number", value="MBR-001")
                 quote_date = st.date_input("Quote Date", value=date.today())
                 valid_till = st.date_input("Valid Till", value=date.today() + timedelta(days=7))
                 package_name = st.text_input("Package Name", value="Luxury Bridal Package")
-                email = st.text_input("Email shown on quotation", value=st.session_state.user_email)
+                email = st.text_input("Email shown on quotation", value=user_email)
 
                 st.markdown("### Services")
                 service_count = st.number_input("Number of services", min_value=1, max_value=12, value=len(default_services), step=1)
@@ -664,34 +617,10 @@ else:
                     services.append({"name": srv_name, "price": srv_price})
 
                 st.markdown("### Charges")
-                travel_charges = st.number_input(
-                    "Travel Charges",
-                    min_value=0.0,
-                    value=0.0,
-                    step=500.0,
-                    disabled=not form_config.get("show_travel_charges", True),
-                )
-                extra_charges = st.number_input(
-                    "Extra Charges",
-                    min_value=0.0,
-                    value=0.0,
-                    step=500.0,
-                    disabled=not form_config.get("show_extra_charges", True),
-                )
-                discount = st.number_input(
-                    "Discount",
-                    min_value=0.0,
-                    value=0.0,
-                    step=500.0,
-                    disabled=not form_config.get("show_discount", True),
-                )
-                advance_paid = st.number_input(
-                    "Advance Paid",
-                    min_value=0.0,
-                    value=0.0,
-                    step=500.0,
-                    disabled=not form_config.get("show_advance_paid", True),
-                )
+                travel_charges = st.number_input("Travel Charges", min_value=0.0, value=0.0, step=500.0, disabled=not form_config.get("show_travel_charges", True))
+                extra_charges = st.number_input("Extra Charges", min_value=0.0, value=0.0, step=500.0, disabled=not form_config.get("show_extra_charges", True))
+                discount = st.number_input("Discount", min_value=0.0, value=0.0, step=500.0, disabled=not form_config.get("show_discount", True))
+                advance_paid = st.number_input("Advance Paid", min_value=0.0, value=0.0, step=500.0, disabled=not form_config.get("show_advance_paid", True))
 
                 st.markdown("### Terms & Notes")
                 quote_terms = []
@@ -747,22 +676,50 @@ else:
                 html = build_quote_html(st.session_state.quote_data, totals)
                 st.components.v1.html(html, height=1220, scrolling=True)
 
-                pdf_bytes, pdf_error = generate_pdf_bytes(html)
-                if pdf_bytes:
-                    st.download_button(
-                        "Download Quotation PDF",
-                        data=pdf_bytes,
-                        file_name=f"{st.session_state.quote_data['quote_number']}.pdf",
-                        mime="application/pdf",
-                    )
-                else:
-                    st.warning(f"PDF export not ready: {pdf_error}")
-                    st.download_button(
-                        "Download Quotation HTML Instead",
-                        data=html,
-                        file_name=f"{st.session_state.quote_data['quote_number']}.html",
-                        mime="text/html",
-                    )
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Save Quotation to Supabase"):
+                        try:
+                            save_quotation(user_id, st.session_state.quote_data, totals)
+                            st.success("Quotation saved successfully.")
+                        except Exception as e:
+                            st.error(f"Could not save quotation: {e}")
+                with c2:
+                    pdf_bytes, pdf_error = generate_pdf_bytes(html)
+                    if pdf_bytes:
+                        st.download_button(
+                            "Download Quotation PDF",
+                            data=pdf_bytes,
+                            file_name=f"{st.session_state.quote_data['quote_number']}.pdf",
+                            mime="application/pdf",
+                        )
+                    else:
+                        st.download_button(
+                            "Download Quotation HTML",
+                            data=html,
+                            file_name=f"{st.session_state.quote_data['quote_number']}.html",
+                            mime="text/html",
+                        )
+                        st.caption(f"PDF not available right now: {pdf_error}")
 
-    st.markdown("---")
-    st.caption("Current version includes login/register, saved artist settings, logo upload stored as base64, configurable form fields, 10 templates, and PDF export support using pdfkit + wkhtmltopdf.")
+    with history_tab:
+        st.subheader("Recent Quotations")
+        try:
+            recent_quotes = get_recent_quotations(user_id)
+            if not recent_quotes:
+                st.info("No quotations saved yet.")
+            else:
+                for row in recent_quotes:
+                    st.markdown(
+                        f"""
+                        <div style='padding:14px;border:1px solid #eee;border-radius:14px;margin-bottom:10px;background:#fff;'>
+                            <strong>{row.get('quote_number', 'No quote no.')}</strong><br>
+                            Client: {row.get('client_name', '')} | Event: {row.get('event_type', '')}<br>
+                            Total: {format_inr(row.get('grand_total', 0) or 0)}<br>
+                            Created: {row.get('created_at', '')}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+        except Exception as e:
+            st.error(f"Could not load quotation history: {e}")
