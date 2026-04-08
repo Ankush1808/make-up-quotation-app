@@ -1,3 +1,0 @@
-streamlit
-pdfkit
-supabase==2.4.0
